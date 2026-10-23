@@ -3,7 +3,7 @@ import {
   Activity, AlertCircle, ArrowDownToLine, BarChart3, BookOpenCheck, Calendar, Check, CheckCircle2,
   ChevronDown, ChevronRight, CircleHelp, Cloud, Copy, Database, FileSpreadsheet, Filter, GraduationCap, LayoutDashboard,
   LoaderCircle, Menu, Pencil, Plus, RefreshCw, Search, Settings, ShieldCheck, SlidersHorizontal,
-  Sparkles, Target, Upload, Users, UserRoundCog, X, RotateCcw, CalendarClock
+  Sparkles, Target, Upload, Users, UserRoundCog, X, RotateCcw, CalendarClock, Info
 } from 'lucide-react';
 import { Bar, BarChart, CartesianGrid, Cell, ComposedChart, LabelList, Legend, Line, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import * as XLSX from 'xlsx';
@@ -15,7 +15,13 @@ import {
   getStoredAppsScriptUrl,
   saveStoredAppsScriptUrl,
   clearStoredAppsScriptUrl,
-  normalizeAppsScriptUrl
+  normalizeAppsScriptUrl,
+  extractUrlFromQuery,
+  fetchServerConfig,
+  saveServerConfig,
+  fetchServerSharedData,
+  saveServerSharedData,
+  createShareableLink
 } from './api';
 import { CalendarPage } from './components/CalendarPage';
 import {
@@ -227,12 +233,14 @@ export default function App() {
         setDraftUrl(clean);
 
         // Muat data langsung dari Google Sheets ke dashboard & tabel
-        setData({
+        const newAppData = {
           ...res.data,
           mandatoryAssignments: res.data.mandatoryAssignments || []
-        });
+        };
+        setData(newAppData);
 
         // Load training history if available and normalize each record
+        let finalHist: Row[] = [];
         try {
           const hist = await jsonp<Row[]>(clean, 'getTrainingHistory', null, 12000);
           if (Array.isArray(hist) && hist.length > 0) {
@@ -250,12 +258,16 @@ export default function App() {
                 const pFinish = p.finishDate || p.tanggalSelesai || pStart;
                 return !histKeys.has(`${pNik}__${pMod}__${pStart}__${pFinish}`);
               });
-              return [...pendingLocal, ...normalizedHist];
+              finalHist = [...pendingLocal, ...normalizedHist];
+              return finalHist;
             });
           }
         } catch {
           // Training history optional
         }
+
+        // Simpan data & history ke server storage agar langsung tersedia bagi seluruh perangkat lain
+        saveServerSharedData(newAppData, finalHist.length ? finalHist : undefined).catch(() => {});
 
         const successMsg = `Koneksi berhasil! Terhubung ke Google Spreadsheet KAI GAM (${res.totalMP || 0} personel MP dimuat).`;
         setTestFeedback({
@@ -312,12 +324,63 @@ export default function App() {
     }
   }, [apiUrl, runTestConnection]);
 
-  // Initial connection test on mount if stored URL exists
+  // Initial connection test and multi-device sync on mount
   useEffect(() => {
-    const saved = getStoredAppsScriptUrl();
-    if (saved && saved.trim()) {
-      runTestConnection(saved.trim(), true);
+    let isMounted = true;
+
+    async function initializeConnection() {
+      // 1. Check if URL was passed via browser query string (?gas=... or ?api=...)
+      const queryGas = extractUrlFromQuery();
+      if (queryGas) {
+        saveStoredAppsScriptUrl(queryGas);
+        await saveServerConfig(queryGas);
+        try {
+          const cleanUrl = window.location.protocol + '//' + window.location.host + window.location.pathname;
+          window.history.replaceState({ path: cleanUrl }, '', cleanUrl);
+        } catch {}
+      }
+
+      // 2. Fetch server configuration and shared data cache
+      const [serverGasUrl, sharedCache] = await Promise.all([
+        fetchServerConfig(),
+        fetchServerSharedData()
+      ]);
+
+      if (!isMounted) return;
+
+      // If server has cached data (manpower, mandatory training, schedules), load immediately so user doesn't wait
+      if (sharedCache) {
+        if (sharedCache.data && typeof sharedCache.data === 'object' && Array.isArray(sharedCache.data.mp)) {
+          setData(prev => ({
+            ...prev,
+            ...sharedCache.data,
+            mandatoryAssignments: sharedCache.data.mandatoryAssignments || prev.mandatoryAssignments || []
+          }));
+        }
+        if (Array.isArray(sharedCache.history) && sharedCache.history.length > 0) {
+          setHistory(sharedCache.history);
+        }
+      }
+
+      // 3. Determine the best Google Apps Script URL: query > localStorage > serverConfig > DEFAULT_URL
+      const localSaved = getStoredAppsScriptUrl();
+      const activeUrl = queryGas || localSaved || serverGasUrl || DEFAULT_URL;
+
+      if (activeUrl && activeUrl.trim()) {
+        const clean = activeUrl.trim();
+        setApiUrl(clean);
+        setDraftUrl(clean);
+        saveStoredAppsScriptUrl(clean);
+        // Auto connect & load live data from Google Sheets!
+        runTestConnection(clean, true);
+      }
     }
+
+    initializeConnection();
+
+    return () => {
+      isMounted = false;
+    };
   }, [runTestConnection]);
 
   // Auto-dismiss notice after 8 seconds
@@ -606,11 +669,12 @@ export default function App() {
 
   const handleClearAllSessions = useCallback(() => {
     setHistory([]);
+    saveServerSharedData(data, []).catch(() => {});
     setNotice({
       type: 'info',
       text: 'Total sesi training berhasil dihapus (0 sesi). Kalender siap menerima jadwal baru dari Excel.'
     });
-  }, []);
+  }, [data]);
 
   const handleImportScheduleRows = async (rows: Row[], overwriteExisting = false) => {
     if (!rows.length) return;
@@ -619,7 +683,9 @@ export default function App() {
     const cleanRows: Row[] = rows.map(r => normalizeScheduleRow(r, allPeople));
 
     // Update history state immediately
+    let finalHistory: Row[] = [];
     if (overwriteExisting) {
+      finalHistory = cleanRows;
       setHistory(cleanRows);
     } else {
       setHistory(prev => {
@@ -630,9 +696,13 @@ export default function App() {
           const pKey = `${String(p.nik || p.NIK || '').trim()}__${String(p.moduleName || p.program || p.module || '').trim().toLowerCase()}__${p.startDate || p.tanggalMulai || ''}__${p.finishDate || p.tanggalSelesai || ''}__${p.sessionTime || ''}`;
           return !cleanKeys.has(pKey);
         });
-        return [...cleanRows, ...filteredPrev];
+        finalHistory = [...cleanRows, ...filteredPrev];
+        return finalHistory;
       });
     }
+
+    // Persist to server storage so any other device gets these schedule training rows immediately
+    saveServerSharedData(data, finalHistory.length ? finalHistory : cleanRows).catch(() => {});
 
     setNotice({
       type: 'success',
@@ -1500,6 +1570,22 @@ export default function App() {
             >
               <RefreshCw size={17} className={loading || testingConnection ? 'spin' : ''} />
             </button>
+            {apiUrl && (
+              <button
+                className="icon-button"
+                title="Salin Link Auto-Connect (Buka di HP / Device Lain Tanpa Input Ulang)"
+                onClick={() => {
+                  const link = createShareableLink(apiUrl);
+                  navigator.clipboard?.writeText(link);
+                  setNotice({
+                    type: 'success',
+                    text: 'Tautan Auto-Connect berhasil disalin! Buka link ini di HP atau perangkat lain untuk langsung terhubung ke Google Sheets.'
+                  });
+                }}
+              >
+                <Copy size={16} />
+              </button>
+            )}
             <button className="profile-button">
               <span className="profile-avatar">KAI</span>
               <span>
@@ -2081,6 +2167,20 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
       category: item.category,
       rawItem: item
     }));
+  }, [filteredTrainingItems]);
+
+  // Ringkasan Total untuk Keterangan & Panduan Membaca Grafik
+  const chartTotals = useMemo(() => {
+    let total = 0;
+    let done = 0;
+    let notDone = 0;
+    filteredTrainingItems.forEach(i => {
+      total += i.total;
+      done += i.done;
+      notDone += i.notDone;
+    });
+    const avgAch = total > 0 ? (done / total) * 100 : 0;
+    return { total, done, notDone, avgAch };
   }, [filteredTrainingItems]);
 
   const [drilldownStatusFilter, setDrilldownStatusFilter] = useState<'PENDING' | 'DONE' | 'ALL'>('PENDING');
@@ -2860,7 +2960,8 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
         {/* COMBINATION COLUMN & LINE CHART FOR TRAINING PROGRESS */}
         <div className="training-combo-chart-container vibrant-chart">
           {trainingComboChartData.length > 0 ? (
-            <div className="training-combo-chart-scroll">
+            <>
+              <div className="training-combo-chart-scroll">
               <div style={{ minWidth: `${Math.max(680, trainingComboChartData.length * 68)}px`, height: 360 }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <ComposedChart
@@ -2874,17 +2975,20 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                     }}
                   >
                     <defs>
+                      {/* Target: Hijau Forest */}
                       <linearGradient id="totalGrad" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor="#6366f1" stopOpacity={0.9} />
-                        <stop offset="100%" stopColor="#4338ca" stopOpacity={0.7} />
+                        <stop offset="0%" stopColor="#2d6a4f" stopOpacity={0.95} />
+                        <stop offset="100%" stopColor="#1b4332" stopOpacity={0.85} />
                       </linearGradient>
+                      {/* Act: Mustard Yellow */}
                       <linearGradient id="doneGrad" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor="#10b981" stopOpacity={0.95} />
-                        <stop offset="100%" stopColor="#059669" stopOpacity={0.8} />
-                      </linearGradient>
-                      <linearGradient id="pendingGrad" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stopColor="#f59e0b" stopOpacity={0.95} />
-                        <stop offset="100%" stopColor="#d97706" stopOpacity={0.8} />
+                        <stop offset="100%" stopColor="#d97706" stopOpacity={0.85} />
+                      </linearGradient>
+                      {/* Pending: Merah Scarlet */}
+                      <linearGradient id="pendingGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="#e63946" stopOpacity={0.95} />
+                        <stop offset="100%" stopColor="#c1121f" stopOpacity={0.85} />
                       </linearGradient>
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
@@ -2909,7 +3013,7 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                       orientation="right"
                       domain={[0, 115]}
                       unit="%"
-                      tick={{ fontSize: 11, fill: '#059669', fontWeight: 700 }}
+                      tick={{ fontSize: 11, fill: '#2563eb', fontWeight: 700 }}
                       axisLine={false}
                       tickLine={false}
                     />
@@ -2924,26 +3028,26 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                               <span className="combo-tooltip-cat">{item.category}</span>
                               <div className="combo-tooltip-body">
                                 <div className="combo-tooltip-row">
-                                  <span className="dot dot-indigo" style={{ background: '#6366f1' }} />
-                                  <span>Target Ditugaskan:</span>
-                                  <b>{fmt(item.total)} orang</b>
+                                  <span className="dot dot-forest" style={{ background: '#2d6a4f' }} />
+                                  <span>Target:</span>
+                                  <b style={{ color: '#86efac' }}>{fmt(item.total)} orang</b>
                                 </div>
                                 <div className="combo-tooltip-row">
-                                  <span className="dot dot-green" style={{ background: '#10b981' }} />
-                                  <span>Peserta Selesai:</span>
-                                  <b style={{ color: '#059669' }}>{fmt(item.done)} orang</b>
+                                  <span className="dot dot-mustard" style={{ background: '#f59e0b' }} />
+                                  <span>Act:</span>
+                                  <b style={{ color: '#fde047' }}>{fmt(item.done)} orang</b>
                                 </div>
                                 {item.notDone > 0 && (
                                   <div className="combo-tooltip-row">
-                                    <span className="dot dot-amber" style={{ background: '#f59e0b' }} />
-                                    <span>Belum Selesai:</span>
-                                    <b style={{ color: '#d97706' }}>{fmt(item.notDone)} orang</b>
+                                    <span className="dot dot-scarlet" style={{ background: '#e63946' }} />
+                                    <span>Pending:</span>
+                                    <b style={{ color: '#fca5a5' }}>{fmt(item.notDone)} orang</b>
                                   </div>
                                 )}
                                 <div className="combo-tooltip-row highlight">
-                                  <span className="dot dot-cyan" style={{ background: '#06b6d4' }} />
-                                  <span>Pencapaian % ACH:</span>
-                                  <b style={{ color: '#0284c7', fontSize: '0.9rem' }}>{percent(item.ach)}</b>
+                                  <span className="dot dot-blue" style={{ background: '#3b82f6' }} />
+                                  <span>Ach %:</span>
+                                  <b style={{ color: '#93c5fd', fontSize: '0.9rem' }}>{percent(item.ach)}</b>
                                 </div>
                               </div>
                               <div className="tooltip-action-prompt">
@@ -2962,7 +3066,7 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                     <Bar
                       yAxisId="left"
                       dataKey="total"
-                      name="Target Ditugaskan (Column)"
+                      name="Target"
                       fill="url(#totalGrad)"
                       radius={[5, 5, 0, 0]}
                       maxBarSize={32}
@@ -2977,7 +3081,7 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                           dataKey="total"
                           position="top"
                           offset={4}
-                          fill="#4338ca"
+                          fill="#1b4332"
                           fontSize={10}
                           fontWeight={700}
                           formatter={(val: any) => (Number(val) > 0 ? `${val}` : '')}
@@ -2987,7 +3091,7 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                     <Bar
                       yAxisId="left"
                       dataKey="done"
-                      name="Peserta Selesai (Column)"
+                      name="Act"
                       fill="url(#doneGrad)"
                       radius={[5, 5, 0, 0]}
                       maxBarSize={32}
@@ -3002,7 +3106,7 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                           dataKey="done"
                           position="top"
                           offset={4}
-                          fill="#059669"
+                          fill="#b45309"
                           fontSize={10}
                           fontWeight={700}
                           formatter={(val: any) => (Number(val) > 0 ? `${val}` : '')}
@@ -3012,7 +3116,7 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                     <Bar
                       yAxisId="left"
                       dataKey="notDone"
-                      name="Belum Selesai (Column)"
+                      name="Pending"
                       fill="url(#pendingGrad)"
                       radius={[5, 5, 0, 0]}
                       maxBarSize={32}
@@ -3027,7 +3131,7 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                           dataKey="notDone"
                           position="top"
                           offset={4}
-                          fill="#d97706"
+                          fill="#c1121f"
                           fontSize={10}
                           fontWeight={700}
                           formatter={(val: any) => (Number(val) > 0 ? `${val}` : '')}
@@ -3038,11 +3142,11 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                       yAxisId="right"
                       type="monotone"
                       dataKey="ach"
-                      name="Capaian % ACH (Line)"
-                      stroke="#06b6d4"
+                      name="Ach %"
+                      stroke="#2563eb"
                       strokeWidth={3.5}
-                      dot={{ r: 5, fill: '#06b6d4', stroke: '#fff', strokeWidth: 2 }}
-                      activeDot={{ r: 7, fill: '#0284c7', stroke: '#fff', strokeWidth: 2 }}
+                      dot={{ r: 5, fill: '#2563eb', stroke: '#fff', strokeWidth: 2 }}
+                      activeDot={{ r: 7, fill: '#1d4ed8', stroke: '#fff', strokeWidth: 2 }}
                       cursor="pointer"
                     >
                       {showChartLabels && (
@@ -3050,7 +3154,7 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                           dataKey="ach"
                           position="top"
                           offset={8}
-                          fill="#0284c7"
+                          fill="#1d4ed8"
                           fontSize={10}
                           fontWeight={800}
                           formatter={(val: any) => `${val}%`}
@@ -3061,8 +3165,101 @@ function Dashboard({ data, totalMP, activeMP, inactiveMP, sectionData, gradeData
                 </ResponsiveContainer>
               </div>
             </div>
-          ) : (
-            <div className="empty-state" style={{ padding: '2.5rem 1rem' }}>
+
+            {/* KETERANGAN & PANDUAN MEMBACA GRAFIK */}
+            <div className="chart-legend-guide-card">
+              <div className="legend-guide-header">
+                <div className="legend-guide-title">
+                  <div className="legend-guide-icon">
+                    <Info size={16} />
+                  </div>
+                  <div>
+                    <h4>Keterangan & Panduan Membaca Grafik</h4>
+                    <p>Definisi indikator warna dan ringkasan metrik training yang sedang ditampilkan</p>
+                  </div>
+                </div>
+
+                {/* Quick dynamic totals pill strip */}
+                <div className="legend-guide-summary-pills">
+                  <div className="summary-pill pill-forest" title="Total target penugasan modul">
+                    <span className="dot dot-forest" />
+                    <span>Target:</span>
+                    <b>{fmt(chartTotals.total)} orang</b>
+                  </div>
+                  <div className="summary-pill pill-mustard" title="Total peserta selesai / lulus">
+                    <span className="dot dot-mustard" />
+                    <span>Act:</span>
+                    <b>{fmt(chartTotals.done)} orang</b>
+                  </div>
+                  <div className="summary-pill pill-scarlet" title="Total peserta belum selesai (pending)">
+                    <span className="dot dot-scarlet" />
+                    <span>Pending:</span>
+                    <b>{fmt(chartTotals.notDone)} orang</b>
+                  </div>
+                  <div className="summary-pill pill-blue" title="Rata-rata persentase capaian">
+                    <span className="dot dot-blue" />
+                    <span>Ach %:</span>
+                    <b>{percent(chartTotals.avgAch)}</b>
+                  </div>
+                </div>
+              </div>
+
+              {/* 4 Cards for the 4 metrics requested */}
+              <div className="legend-guide-grid">
+                <div className="legend-guide-item item-forest">
+                  <div className="legend-item-head">
+                    <span className="legend-color-box swatch-forest" />
+                    <div className="legend-item-titles">
+                      <b>Target</b>
+                      <span className="legend-type-tag tag-forest">Column · Hijau Forest</span>
+                    </div>
+                  </div>
+                  <p>Jumlah total personel / karyawan yang ditugaskan (assigned) untuk mengikuti program pelatihan.</p>
+                </div>
+
+                <div className="legend-guide-item item-mustard">
+                  <div className="legend-item-head">
+                    <span className="legend-color-box swatch-mustard" />
+                    <div className="legend-item-titles">
+                      <b>Act</b>
+                      <span className="legend-type-tag tag-mustard">Column · Mustard Yellow</span>
+                    </div>
+                  </div>
+                  <p>Jumlah peserta aktual yang telah menyelesaikan pelatihan dan dinyatakan lulus (Done).</p>
+                </div>
+
+                <div className="legend-guide-item item-scarlet">
+                  <div className="legend-item-head">
+                    <span className="legend-color-box swatch-scarlet" />
+                    <div className="legend-item-titles">
+                      <b>Pending</b>
+                      <span className="legend-type-tag tag-scarlet">Column · Merah Scarlet</span>
+                    </div>
+                  </div>
+                  <p>Jumlah peserta yang belum menyelesaikan pelatihan (Pending) dan memerlukan tindak lanjut / penjadwalan.</p>
+                </div>
+
+                <div className="legend-guide-item item-blue">
+                  <div className="legend-item-head">
+                    <span className="legend-color-box swatch-blue" />
+                    <div className="legend-item-titles">
+                      <b>Ach %</b>
+                      <span className="legend-type-tag tag-blue">Line · Royal Blue</span>
+                    </div>
+                  </div>
+                  <p>Persentase tingkat capaian kelulusan modul pelatihan terhadap target penugasan (Act ÷ Target × 100%).</p>
+                </div>
+              </div>
+
+              {/* Click instruction hint */}
+              <div className="legend-guide-footer">
+                <span className="tip-badge">💡 Tip Analisa:</span>
+                <span>Klik batang kolom modul atau titik garis pada grafik di atas untuk langsung membuka popup rincian mini data berisi daftar NIK, Nama, dan status peserta yang belum selesai (Pending).</span>
+              </div>
+            </div>
+          </>
+        ) : (
+          <div className="empty-state" style={{ padding: '2.5rem 1rem' }}>
               Tidak ada data modul training yang cocok dengan filter saat ini. Silakan ubah filter modul atau status.
             </div>
           )}
@@ -4686,6 +4883,21 @@ function SettingsPage({
             <span>{loading ? 'Menguji...' : 'Uji Koneksi'}</span>
           </button>
 
+          {(activeUrl || draftUrl) && (
+            <button
+              className="btn btn-light"
+              onClick={() => {
+                const link = createShareableLink(draftUrl || activeUrl);
+                navigator.clipboard?.writeText(link);
+                alert('Tautan Auto-Connect berhasil disalin ke clipboard! Buka tautan ini di perangkat lain (HP/tablet/laptop) untuk otomatis terhubung tanpa perlu menginput ulang.');
+              }}
+              title="Salin tautan siap pakai untuk dibuka di perangkat lain"
+            >
+              <Copy size={15} />
+              <span>Salin Link Auto-Connect</span>
+            </button>
+          )}
+
           {connected && (
             <button
               className="btn btn-light"
@@ -4697,6 +4909,15 @@ function SettingsPage({
               <span>Putuskan</span>
             </button>
           )}
+        </div>
+
+        {/* Multi-Device Global Sync Info */}
+        <div style={{ marginTop: '1rem', padding: '0.85rem 1rem', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '8px', display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <Cloud size={20} style={{ color: '#2563eb', flexShrink: 0 }} />
+          <div style={{ fontSize: '0.78rem', color: '#475569', lineHeight: '1.45' }}>
+            <b style={{ color: '#1e293b' }}>Koneksi Multi-Perangkat Aktif: </b>
+            URL dan data Google Sheets yang disimpan di sini otomatis disinkronkan ke server. Saat membuka link web ini di HP atau komputer lain, data Manpower, Mandatory Training, dan Schedule Training akan langsung termuat tanpa perlu diinput lagi.
+          </div>
         </div>
 
         {/* Live Feedback Card for Connection Test */}

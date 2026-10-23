@@ -57,6 +57,11 @@ export function saveStoredAppsScriptUrl(url: string): void {
   } catch (err) {
     console.warn('Gagal menyimpan URL Apps Script ke localStorage', err);
   }
+
+  // Also sync to server so other devices get it automatically
+  if (clean) {
+    saveServerConfig(clean).catch(err => console.warn('Gagal sync config ke server:', err));
+  }
 }
 
 export function clearStoredAppsScriptUrl(): void {
@@ -65,6 +70,121 @@ export function clearStoredAppsScriptUrl(): void {
     localStorage.removeItem(STORAGE_KEY_URL_ALT);
   } catch (err) {
     console.warn('Gagal menghapus URL Apps Script dari localStorage', err);
+  }
+
+  // Also clear on server
+  saveServerConfig('').catch(err => console.warn('Gagal reset config server:', err));
+}
+
+/**
+ * Extracts URL from query parameter if user opened link like ?gas=... or ?api=... or ?url=...
+ */
+export function extractUrlFromQuery(): string {
+  try {
+    if (typeof window === 'undefined') return '';
+    const params = new URLSearchParams(window.location.search);
+    const gas = params.get('gas') || params.get('api') || params.get('url') || '';
+    if (gas && gas.trim()) {
+      return gas.trim();
+    }
+  } catch {
+    // ignore
+  }
+  return '';
+}
+
+/**
+ * Fetches server-stored Google Apps Script Web App URL (shared for all devices).
+ */
+export async function fetchServerConfig(): Promise<string> {
+  try {
+    const res = await fetch('/api/config');
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.config && typeof data.config.gasUrl === 'string') {
+        return data.config.gasUrl.trim();
+      }
+    }
+  } catch (err) {
+    console.warn('Could not fetch /api/config:', err);
+  }
+  return '';
+}
+
+/**
+ * Saves Google Apps Script URL to server storage so that any other device
+ * opening the app immediately connects without manual input.
+ */
+export async function saveServerConfig(gasUrl: string): Promise<boolean> {
+  try {
+    const res = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gasUrl: gasUrl.trim() })
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn('Could not save /api/config:', err);
+    return false;
+  }
+}
+
+/**
+ * Fetches shared data cached on server (Manpower, Mandatory Assignments, and Schedule Training).
+ */
+export async function fetchServerSharedData(): Promise<{
+  data?: any;
+  history?: any[];
+  gasUrl?: string;
+  lastSync?: string;
+} | null> {
+  try {
+    const res = await fetch('/api/shared-data');
+    if (res.ok) {
+      const body = await res.json();
+      return {
+        gasUrl: body.gasUrl,
+        data: body.sharedData?.data,
+        history: body.sharedData?.history,
+        lastSync: body.sharedData?.lastSync
+      };
+    }
+  } catch (err) {
+    console.warn('Could not fetch /api/shared-data:', err);
+  }
+  return null;
+}
+
+/**
+ * Saves shared data to server cache so when opening on other devices,
+ * schedules and assignments are immediately visible even before fetching from Sheets.
+ */
+export async function saveServerSharedData(data?: any, history?: any[]): Promise<boolean> {
+  try {
+    const res = await fetch('/api/shared-data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data, history })
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn('Could not save /api/shared-data:', err);
+    return false;
+  }
+}
+
+/**
+ * Generates an auto-connect share link containing the active Google Sheets URL.
+ */
+export function createShareableLink(gasUrl?: string): string {
+  try {
+    if (typeof window === 'undefined') return '';
+    const base = `${window.location.protocol}//${window.location.host}${window.location.pathname}`;
+    const target = gasUrl || getStoredAppsScriptUrl();
+    if (!target) return base;
+    return `${base}?gas=${encodeURIComponent(target)}`;
+  } catch {
+    return '';
   }
 }
 

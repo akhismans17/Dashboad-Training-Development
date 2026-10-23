@@ -39,6 +39,8 @@ import {
   Bookmark
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
+import { jsPDF } from 'jspdf';
+import autoTable from 'jspdf-autotable';
 import {
   normalizeDateToISO,
   extractItemDates,
@@ -976,6 +978,143 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
     XLSX.writeFile(wb, 'Template_Jadwal_Training_Peserta.xlsx');
   };
 
+  const exportToPDF = () => {
+    try {
+      const doc = new jsPDF({
+        orientation: 'landscape',
+        unit: 'mm',
+        format: 'a4'
+      });
+
+      const currentMonthLabel = `${MONTH_NAMES_ID[currentMonth]} ${currentYear}`;
+      const filterSummaryParts = [
+        `Periode: ${currentMonthLabel}`,
+        statusFilter !== 'ALL' ? `Status: ${statusFilter}` : null,
+        moduleFilter !== 'ALL' ? `Modul: ${moduleFilter}` : null,
+        sessionFilter !== 'ALL' ? `Sesi: ${sessionFilter}` : null,
+        searchQuery ? `Pencarian: "${searchQuery}"` : null
+      ].filter(Boolean);
+
+      const filterSummary = filterSummaryParts.join('  |  ');
+
+      // Top Header Colored Banner (Forest Green #1b4332)
+      doc.setFillColor(27, 67, 50);
+      doc.rect(0, 0, 297, 24, 'F');
+
+      // Brand Title
+      doc.setTextColor(255, 255, 255);
+      doc.setFontSize(14);
+      doc.setFont('helvetica', 'bold');
+      doc.text('PT KARUNIA ARMADA INDONESIA · SITE GAM', 14, 10);
+
+      doc.setFontSize(9.5);
+      doc.setFont('helvetica', 'normal');
+      doc.text('MANPOWER & TRAINING DEVELOPMENT · LAPORAN JADWAL & AGENDA PELATIHAN', 14, 17);
+
+      // Subheading & Filter info
+      doc.setTextColor(15, 23, 42);
+      doc.setFontSize(11);
+      doc.setFont('helvetica', 'bold');
+      doc.text(`AGENDA JADWAL TRAINING · ${currentMonthLabel.toUpperCase()}`, 14, 32);
+
+      doc.setFontSize(8.5);
+      doc.setFont('helvetica', 'normal');
+      doc.setTextColor(100, 116, 139);
+      doc.text(filterSummary || `Periode: ${currentMonthLabel} (Semua Modul & Status)`, 14, 38);
+
+      const printDateStr = new Date().toLocaleDateString('id-ID', {
+        day: 'numeric',
+        month: 'long',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+      doc.text(`Dicetak pada: ${printDateStr} WIB · Total: ${filteredSessions.length} Sesi`, 283, 38, { align: 'right' });
+
+      // Table data
+      const tableData = filteredSessions.map((s, idx) => {
+        const participantSummary = s.participants.length > 0
+          ? `${s.participants.length} org\n(${s.participants.slice(0, 3).map(p => p.name || p.nik).join(', ')}${s.participants.length > 3 ? ` +${s.participants.length - 3}` : ''})`
+          : 'Belum ada peserta';
+
+        return [
+          idx + 1,
+          s.dateDisplay || `${s.startDate} s/d ${s.finishDate}`,
+          s.moduleName || '-',
+          s.trainer || 'Belum Ditentukan',
+          s.location || 'Ruang Training GAM',
+          s.sessionTime || 'Regular',
+          participantSummary,
+          s.status || 'TERJADWAL'
+        ];
+      });
+
+      autoTable(doc, {
+        startY: 42,
+        head: [['No', 'Tanggal Pelaksanaan', 'Nama Modul Training', 'Trainer / Instruktur', 'Lokasi / Ruang', 'Waktu Sesi', 'Peserta Terdaftar', 'Status']],
+        body: tableData.length > 0 ? tableData : [['-', '-', 'Tidak ada data jadwal training yang cocok dengan filter saat ini', '-', '-', '-', '-', '-']],
+        theme: 'grid',
+        headStyles: {
+          fillColor: [27, 67, 50],
+          textColor: [255, 255, 255],
+          fontSize: 8.5,
+          fontStyle: 'bold',
+          halign: 'center',
+          valign: 'middle'
+        },
+        bodyStyles: {
+          fontSize: 8,
+          textColor: [30, 41, 59],
+          valign: 'middle'
+        },
+        alternateRowStyles: {
+          fillColor: [248, 250, 252]
+        },
+        columnStyles: {
+          0: { cellWidth: 10, halign: 'center' },
+          1: { cellWidth: 32, halign: 'center' },
+          2: { cellWidth: 54, fontStyle: 'bold' },
+          3: { cellWidth: 36 },
+          4: { cellWidth: 32 },
+          5: { cellWidth: 26, halign: 'center' },
+          6: { cellWidth: 52 },
+          7: { cellWidth: 27, halign: 'center', fontStyle: 'bold' }
+        },
+        didParseCell: (data) => {
+          if (data.section === 'body' && data.column.index === 7) {
+            const val = String(data.cell.raw || '').toUpperCase();
+            if (val.includes('SELESAI') || val.includes('DONE') || val.includes('LULUS')) {
+              data.cell.styles.textColor = [5, 150, 105]; // green
+            } else if (val.includes('SEDANG') || val.includes('ONGOING')) {
+              data.cell.styles.textColor = [37, 99, 235]; // blue
+            } else if (val.includes('BELUM') || val.includes('PENDING')) {
+              data.cell.styles.textColor = [220, 38, 38]; // red
+            } else {
+              data.cell.styles.textColor = [124, 58, 237]; // purple upcoming
+            }
+          }
+        },
+        margin: { top: 42, left: 14, right: 14, bottom: 18 },
+        didDrawPage: (data) => {
+          const pageCount = (doc as any).internal.getNumberOfPages();
+          doc.setFontSize(7.5);
+          doc.setTextColor(148, 163, 184);
+          doc.text(
+            `PT Karunia Armada Indonesia Site GAM · Laporan Resmi Jadwal Training · Halaman ${data.pageNumber} dari ${pageCount}`,
+            14,
+            doc.internal.pageSize.height - 8
+          );
+        }
+      });
+
+      const fileName = `Laporan_Jadwal_Training_${MONTH_NAMES_ID[currentMonth]}_${currentYear}.pdf`.replace(/\s+/g, '_');
+      doc.save(fileName);
+    } catch (err) {
+      console.error('Error generating PDF:', err);
+      window.print();
+    }
+  };
+
   const handleConfirmExcelImport = async () => {
     if (!parsedScheduleRows.length) return;
     setSchedSaving(true);
@@ -1371,6 +1510,15 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
             </button>
           )}
           <button
+            type="button"
+            className="btn btn-primary"
+            style={{ background: '#1b4332', borderColor: '#1b4332', color: '#ffffff', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+            onClick={exportToPDF}
+            title="Export jadwal training yang sedang difilter ke dokumen PDF cetak"
+          >
+            <FileText size={15} /> Export ke PDF
+          </button>
+          <button
             className="btn btn-primary"
             style={{ background: '#059669', borderColor: '#059669', color: '#ffffff' }}
             onClick={() => {
@@ -1536,7 +1684,7 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
           </button>
         </div>
 
-        {/* Center: View Switcher */}
+        {/* Center: View Switcher & Quick Export PDF */}
         <div className="cal-view-segmented">
           <button
             className={`seg-btn ${viewMode === 'calendar' ? 'active' : ''}`}
@@ -1549,6 +1697,15 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
             onClick={() => setViewMode('agenda')}
           >
             <ListFilter size={15} /> Daftar Agenda
+          </button>
+          <button
+            type="button"
+            className="seg-btn cal-pdf-quick-btn"
+            style={{ color: '#166534', fontWeight: 700 }}
+            onClick={exportToPDF}
+            title="Download laporan jadwal training terfilter dalam format PDF cetak"
+          >
+            <Download size={14} style={{ color: '#166534' }} /> Export PDF
           </button>
         </div>
 
@@ -1656,126 +1813,102 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
       {viewMode === 'calendar' ? (
         /* CALENDAR MONTH GRID VIEW */
         <div className="calendar-grid-card panel">
-          {/* Weekday Labels */}
-          <div className="calendar-weekdays-header">
-            {DAY_NAMES_ID.map((name, idx) => (
-              <div key={name} className={`weekday-col ${idx >= 5 ? 'weekend' : ''}`}>
-                <span>{name.toUpperCase()}</span>
-              </div>
-            ))}
-          </div>
-
-          {/* Day Grid Cells */}
-          <div className="calendar-cells-grid">
-            {calendarDays.map((cell, idx) => {
-              const daySessions = sessionsByDate.get(cell.dateStr) || [];
-              const isWeekend = idx % 7 >= 5;
-
-              return (
-                <div
-                  key={cell.dateStr}
-                  className={`calendar-cell ${!cell.isCurrentMonth ? 'other-month' : ''} ${cell.isToday ? 'today-cell' : ''} ${isWeekend ? 'weekend-cell' : ''}`}
-                  onClick={() => {
-                    if (daySessions.length > 0) {
-                      setSelectedDaySessions({ date: cell.dateStr, sessions: daySessions });
-                    } else if (cell.isCurrentMonth) {
-                      // Schedule new session on this date
-                      setSchedStartDate(cell.dateStr);
-                      setSchedFinishDate(cell.dateStr);
-                      setIsScheduleModalOpen(true);
-                    }
-                  }}
-                >
-                  {/* Cell Header: Day number & Badge */}
-                  <div className="cell-top-bar">
-                    <span className={`cell-day-num ${cell.isToday ? 'today-badge' : ''}`}>
-                      {cell.dayNumber}
-                    </span>
-                    {cell.isToday && (
-                      <span className="today-chip">Hari Ini</span>
-                    )}
-                    {daySessions.length > 0 && !cell.isToday && (
-                      <span className="session-count-indicator">
-                        {daySessions.length} sesi
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Session Items in this cell */}
-                  <div className="cell-sessions-stack">
-                    {daySessions.slice(0, 3).map(session => {
-                      const style = getBadgeStyle(session.statusCategory);
-                      const isMultiDay = session.startDate !== session.finishDate;
-                      const isStart = session.startDate === cell.dateStr;
-                      const isFinish = session.finishDate === cell.dateStr;
-
-                      return (
-                        <div
-                          key={session.id}
-                          className="cell-session-pill"
-                          style={{
-                            backgroundColor: style.bg,
-                            borderColor: style.border,
-                            color: style.text
-                          }}
-                          onClick={e => {
-                            e.stopPropagation();
-                            setSelectedSession(session);
-                          }}
-                          title={`${session.moduleName} (${style.label})\n${session.dateDisplay}\n${session.participants.length} peserta`}
-                        >
-                          <span className="pill-dot" style={{ backgroundColor: style.dot }} />
-                          <span className="pill-title">{session.moduleName}</span>
-                          {session.sessionTime && (
-                            <span
-                              style={{
-                                fontSize: '0.6rem',
-                                padding: '1px 3px',
-                                borderRadius: '3px',
-                                background: 'rgba(0,0,0,0.06)',
-                                fontWeight: 700,
-                                flexShrink: 0
-                              }}
-                              title={session.sessionTime}
-                            >
-                              {session.sessionTime.includes('Sesi 1') ? 'S1' : session.sessionTime.includes('Sesi 2') ? 'S2' : session.sessionTime.includes('Sesi 3') ? 'S3' : session.sessionTime.includes('Full') ? 'Full' : 'Sesi'}
-                            </span>
-                          )}
-                          <span className="pill-count">
-                            <Users size={9} style={{ display: 'inline', marginRight: '2px' }} />
-                            {session.participants.length}
-                          </span>
-                          {isMultiDay && isStart && (
-                            <span className="pill-multi-indicator" title="Mulai sesi hari ini">Mulai</span>
-                          )}
-                          {isMultiDay && isFinish && !isStart && (
-                            <span className="pill-multi-indicator" title="Selesai sesi hari ini">Akhir</span>
-                          )}
-                        </div>
-                      );
-                    })}
-
-                    {daySessions.length > 3 && (
-                      <button
-                        className="cell-more-btn"
-                        onClick={e => {
-                          e.stopPropagation();
-                          setSelectedDaySessions({ date: cell.dateStr, sessions: daySessions });
-                        }}
-                      >
-                        +{daySessions.length - 3} sesi lainnya
-                      </button>
-                    )}
-
-                    {daySessions.length === 0 && cell.isCurrentMonth && (
-                      <div className="cell-empty-hover">
-                        <span>+ Input Jadwal</span>
-                      </div>
-                    )}
-                  </div>
+          <div className="calendar-grid-scroll-wrap">
+            {/* Weekday Labels */}
+            <div className="calendar-weekdays-header">
+              {DAY_NAMES_ID.map((name, idx) => (
+                <div key={name} className={`weekday-col ${idx >= 5 ? 'weekend' : ''}`}>
+                  <span>{name.toUpperCase()}</span>
                 </div>
-              );
-            })}
+              ))}
+            </div>
+
+            {/* Day Grid Cells */}
+            <div className="calendar-cells-grid">
+              {calendarDays.map((cell, idx) => {
+                const daySessions = sessionsByDate.get(cell.dateStr) || [];
+                const isWeekend = idx % 7 >= 5;
+
+                return (
+                  <div
+                    key={cell.dateStr}
+                    className={`calendar-cell ${!cell.isCurrentMonth ? 'other-month' : ''} ${cell.isToday ? 'today-cell' : ''} ${isWeekend ? 'weekend-cell' : ''}`}
+                    onClick={() => {
+                      if (daySessions.length > 0) {
+                        setSelectedDaySessions({ date: cell.dateStr, sessions: daySessions });
+                      } else if (cell.isCurrentMonth) {
+                        // Schedule new session on this date
+                        setSchedStartDate(cell.dateStr);
+                        setSchedFinishDate(cell.dateStr);
+                        setIsScheduleModalOpen(true);
+                      }
+                    }}
+                  >
+                    {/* Cell Header: Day number & Badge */}
+                    <div className="cell-top-bar">
+                      <span className={`cell-day-num ${cell.isToday ? 'today-badge' : ''}`}>
+                        {cell.dayNumber}
+                      </span>
+                      {cell.isToday && (
+                        <span className="today-chip">Hari Ini</span>
+                      )}
+                      {daySessions.length > 0 && !cell.isToday && (
+                        <span className="session-count-indicator">
+                          {daySessions.length} Training
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Session Items in this cell - ALL sessions rendered directly */}
+                    <div className="cell-sessions-stack">
+                      {daySessions.map(session => {
+                        const style = getBadgeStyle(session.statusCategory);
+
+                        return (
+                          <div
+                            key={session.id}
+                            className="cell-session-card"
+                            style={{
+                              backgroundColor: style.bg,
+                              borderColor: style.border,
+                              color: style.text
+                            }}
+                            onClick={e => {
+                              e.stopPropagation();
+                              setSelectedSession(session);
+                            }}
+                            title={`${session.moduleName} (${style.label})\nTrainer: ${session.trainer || 'Belum Ditentukan'}\n${session.dateDisplay}\n${session.participants.length} peserta\nKlik untuk melihat detail`}
+                          >
+                            <div className="session-card-main">
+                              <span className="pill-dot" style={{ backgroundColor: style.dot }} />
+                              <span className="session-card-title">{session.moduleName}</span>
+                              {session.participants.length > 0 && (
+                                <span className="session-card-count" title={`${session.participants.length} peserta`}>
+                                  <Users size={9} style={{ display: 'inline', marginRight: '2px' }} />
+                                  {session.participants.length}
+                                </span>
+                              )}
+                            </div>
+                            <div className="session-card-trainer">
+                              <UserCheck size={11} style={{ flexShrink: 0, opacity: 0.85 }} />
+                              <span className="trainer-name-text">
+                                {session.trainer ? session.trainer : 'Trainer: -'}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+
+                      {daySessions.length === 0 && cell.isCurrentMonth && (
+                        <div className="cell-empty-hover">
+                          <span>+ Input Jadwal</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
       ) : (

@@ -4,24 +4,30 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --port 3000 --host 0.0.0.0",
+    "dev": "tsx server.ts",
     "build": "vite build",
+    "start": "tsx server.ts",
     "preview": "vite preview --port 3000 --host 0.0.0.0",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "@vitejs/plugin-react": "latest",
+    "express": "^5.3.0",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.9",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
     "recharts": "latest",
     "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
     "typescript": "latest",
     "vite": "latest",
     "xlsx": "latest"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^26.6.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0"
